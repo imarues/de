@@ -4,6 +4,8 @@
 #import <stdint.h>
 #import "IslandBridge.h"
 
+extern void KiraIslandRunDiagnostics(void);
+
 // Runtime hook: observe URLSession download tasks without modifying DataManager UI.
 // Ordinary URLSession data tasks (including advertising/network API traffic) are ignored.
 @interface IKDownloadObservation : NSObject
