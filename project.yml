@@ -30,7 +30,7 @@ targets:
     type: library.dynamic
     platform: iOS
     sources:
-      - Hook/IslandBridge.swift
+      - Hook
     dependencies:
       - target: IslandShared
         embed: false
