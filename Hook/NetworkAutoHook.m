@@ -112,5 +112,8 @@ static void IKInstallDownloadHook(void) {
 }
 
 __attribute__((constructor)) static void IKLoadNetworkHooks(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{ IKInstallDownloadHook(); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        IKInstallDownloadHook();
+        KiraIslandRunDiagnostics();
+    });
 }
