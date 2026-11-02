@@ -34,10 +34,16 @@ jobs:
           set -euo pipefail
           SRC="build/Build/Products/Release-iphoneos"
           mkdir -p output
-          find "$SRC" -type f \( -name 'libIslandHook.dylib' -o -name '*.dylib' \) -exec cp {} output/ \;
+          # Copy only the compiled Mach-O library, not a dSYM companion file.
+          if [[ -f "$SRC/libIslandHook.dylib" ]]; then
+            cp "$SRC/libIslandHook.dylib" output/libIslandHook.dylib
+          else
+            cp "$SRC/IslandDemo.app/libIslandHook.dylib" output/libIslandHook.dylib
+          fi
           find "$SRC" -maxdepth 1 -type d \( -name '*.appex' -o -name '*.framework' -o -name '*.app' \) -exec cp -R {} output/ \;
           test -s output/libIslandHook.dylib
           file output/libIslandHook.dylib
+          file output/libIslandHook.dylib | grep -q 'dynamically linked shared library'
       - uses: actions/upload-artifact@v4
         if: success()
         with:
