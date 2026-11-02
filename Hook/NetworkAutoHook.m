@@ -4,184 +4,252 @@
 #import <stdint.h>
 #import "IslandBridge.h"
 
-// This hook observes URLSession tasks; it does not change the network request,
-// the output filename, the bytes written, the original delegate, or task resume.
-// Unlike v1 it considers large DATA tasks, because download managers often
-// implement their own storage/resume logic using URLSessionDataTask.
-@interface IKDownloadObservation : NSObject
-@property (nonatomic, strong) NSURLSessionTask *task;
-@property (nonatomic) int32_t activityID;
-@property (nonatomic) BOOL started;
-@property (nonatomic) int64_t previousBytes;
-@property (nonatomic, strong) NSDate *previousTime;
+// Does not change requests, stored data, delegate callbacks or existing
+// download logic. Observes NSURLSession delegate callbacks to identify
+// user-visible transfers and pass their actual byte counts to ActivityKit.
+@interface IKTaskObservation : NSObject
+@property(nonatomic,strong) NSURLSessionTask *task;
+@property(nonatomic) int32_t activityID;
+@property(nonatomic) BOOL running;
+@property(nonatomic) int64_t lastBytes;
+@property(nonatomic,strong) NSDate *lastDate;
 @end
-@implementation IKDownloadObservation
+@implementation IKTaskObservation
 @end
 
-static NSMapTable<NSURLSessionTask *, IKDownloadObservation *> *gDownloads;
-static NSMutableSet<NSString *> *gHookedClasses;
-static NSTimer *gTimer;
+static NSMapTable<NSURLSessionTask *, IKTaskObservation *> *gTasks;
+static NSMutableSet<NSString *> *gInstalled;
+static NSTimer *gPollingTimer;
 static int32_t gNextID = 1000;
 
-static BOOL IKIsUserDownload(NSURLSessionTask *task) {
-    if ([task isKindOfClass:[NSURLSessionDownloadTask class]]) return YES;
-    if (![task isKindOfClass:[NSURLSessionDataTask class]]) return NO;
-
-    NSHTTPURLResponse *http = [task.response isKindOfClass:[NSHTTPURLResponse class]]
+static BOOL IKIsValidDownload(NSURLSessionTask *task, int64_t bytes) {
+    if ([task isKindOfClass:[NSURLSessionDownloadTask class]]) {
+        return bytes >= 1024 * 1024;
+    }
+    NSHTTPURLResponse *response = [task.response isKindOfClass:[NSHTTPURLResponse class]]
         ? (NSHTTPURLResponse *)task.response : nil;
-    NSString *type = (http.MIMEType ?: @"").lowercaseString;
+    if (!response) return NO;
+    NSString *mime = response.MIMEType.lowercaseString ?: @"";
     NSString *disposition = @"";
-    for (NSString *key in http.allHeaderFields) {
-        if ([key caseInsensitiveCompare:@"content-disposition"] == NSOrderedSame) {
-            disposition = [http.allHeaderFields[key] description].lowercaseString;
+    for (id key in response.allHeaderFields) {
+        if ([[key description] caseInsensitiveCompare:@"content-disposition"] == NSOrderedSame) {
+            disposition = [response.allHeaderFields[key] description].lowercaseString;
             break;
         }
     }
-    NSURL *url = task.currentRequest.URL ?: task.originalRequest.URL;
-    NSString *path = url.path.lowercaseString ?: @"";
+    NSString *path = (task.currentRequest.URL ?: task.originalRequest.URL).path.lowercaseString ?: @"";
     NSString *ext = path.pathExtension;
-    int64_t expected = task.countOfBytesExpectedToReceive;
-    if (expected <= 0) expected = task.response.expectedContentLength;
-
-    BOOL binaryType = [type containsString:@"octet-stream"] ||
-                      [type containsString:@"application/zip"] ||
-                      [type containsString:@"application/x-apple-diskimage"] ||
-                      [type containsString:@"application/vnd.debian.binary-package"];
-    BOOL extensionIsFile = [@[@"ipa", @"zip", @"deb", @"dylib", @"7z", @"rar",
-                              @"mp4", @"mov", @"pdf", @"apk", @"exe", @"dmg",
-                              @"bin", @"pkg"] containsObject:ext];
-    BOOL isDLPath = [path hasPrefix:@"/dl/"];
-    BOOL hasAttachment = [disposition containsString:@"attachment"];
-
-    // Do not show unrelated ads, thumbnails, JSON, API requests, etc.
-    if (expected >= 1024 * 1024 &&
-        (isDLPath || extensionIsFile || hasAttachment || binaryType)) return YES;
-    // Some servers stream with unknown Content-Length: require a meaningful
-    // path/header and at least 1 MB actually received before creating activity.
-    if (expected <= 0 && task.countOfBytesReceived >= 1024 * 1024 &&
-        (isDLPath || extensionIsFile || hasAttachment)) return YES;
-    return NO;
+    BOOL knownExtension = [@[@"ipa", @"zip", @"dylib", @"deb", @"7z", @"rar", @"pdf",
+                             @"mp4", @"mov", @"apk", @"exe", @"dmg", @"pkg", @"bin"]
+                           containsObject:ext];
+    BOOL binaryType = [mime containsString:@"octet-stream"] ||
+                      [mime containsString:@"application/zip"] ||
+                      [mime containsString:@"application/pdf"] ||
+                      [mime containsString:@"application/x-debian"] ||
+                      [mime containsString:@"application/vnd.debian"];
+    BOOL attachment = [disposition containsString:@"attachment"];
+    // Require actual downloaded bytes to suppress advertising/API traffic.
+    return bytes >= 1024 * 1024 &&
+           (knownExtension || [path hasPrefix:@"/dl/"] || binaryType || attachment);
 }
 
-static void IKPollDownloads(NSTimer *unused) {
-    (void)unused;
-    NSArray<NSURLSessionTask *> *tasks = [[gDownloads keyEnumerator] allObjects];
-    NSDate *now = [NSDate date];
-    for (NSURLSessionTask *task in tasks) {
-        IKDownloadObservation *entry = [gDownloads objectForKey:task];
-        if (!entry) continue;
-
-        NSURLSessionTaskState state = task.state;
-        BOOL finished = (state == NSURLSessionTaskStateCompleted || state == NSURLSessionTaskStateCanceling);
-        if (!entry.started && !finished && IKIsUserDownload(task)) {
-            NSURL *url = task.currentRequest.URL ?: task.originalRequest.URL;
-            NSString *fileName = task.response.suggestedFilename ?: url.lastPathComponent;
-            if (fileName.length == 0) fileName = @"Download";
-            entry.activityID = ++gNextID;
-            entry.started = YES;
-            entry.previousBytes = 0;
-            entry.previousTime = now;
-            KiraIslandStart(entry.activityID, fileName.UTF8String);
-            NSLog(@"[KiraIsland] Live progress started: %@", fileName);
-        }
-        if (entry.started) {
-            int64_t received = MAX((int64_t)0, task.countOfBytesReceived);
-            int64_t expected = task.countOfBytesExpectedToReceive;
-            if (expected <= 0) expected = task.response.expectedContentLength;
-            NSTimeInterval elapsed = [now timeIntervalSinceDate:entry.previousTime];
-            double speed = elapsed > 0.0 ?
-                MAX(0.0, (double)(received - entry.previousBytes) / elapsed) : 0;
-            entry.previousBytes = received;
-            entry.previousTime = now;
-
-            if (finished) {
-                KiraIslandFinish(entry.activityID,
-                                 state == NSURLSessionTaskStateCompleted && task.error == nil,
-                                 received, expected);
-            } else {
-                KiraIslandProgress(entry.activityID, received, expected, speed);
-            }
-        }
-        if (finished) [gDownloads removeObjectForKey:task];
+static IKTaskObservation *IKGetOrCreate(NSURLSessionTask *task) {
+    if (!gTasks) gTasks = [NSMapTable strongToStrongObjectsMapTable];
+    IKTaskObservation *item = [gTasks objectForKey:task];
+    if (!item) {
+        item = [IKTaskObservation new];
+        item.task = task;
+        item.lastDate = [NSDate date];
+        [gTasks setObject:item forKey:task];
     }
-    if (gDownloads.count == 0) {
-        [gTimer invalidate];
-        gTimer = nil;
+    return item;
+}
+
+static void IKUpdate(NSURLSessionTask *task, int64_t received, int64_t expected, BOOL ended, BOOL success) {
+    if (!task) return;
+    IKTaskObservation *item = IKGetOrCreate(task);
+    received = MAX(0, received);
+    if (expected <= 0) expected = task.response.expectedContentLength;
+    if (expected <= 0) expected = task.countOfBytesExpectedToReceive;
+    NSDate *now = [NSDate date];
+
+    if (!item.running && !ended && IKIsValidDownload(task, received)) {
+        NSURL *url = task.currentRequest.URL ?: task.originalRequest.URL;
+        NSString *name = task.response.suggestedFilename ?: url.lastPathComponent;
+        if (!name.length) name = @"Download";
+        item.activityID = ++gNextID;
+        item.running = YES;
+        item.lastBytes = 0;
+        item.lastDate = now;
+        KiraIslandStart(item.activityID, name.UTF8String);
+        NSLog(@"[KiraIsland] START %@ received=%lld expected=%lld", name, received, expected);
+    }
+
+    if (!item.running) {
+        if (ended) [gTasks removeObjectForKey:task];
+        return;
+    }
+
+    NSTimeInterval dt = [now timeIntervalSinceDate:item.lastDate];
+    double speed = dt > 0 ? MAX(0.0, (double)(received - item.lastBytes) / dt) : 0;
+    item.lastBytes = received;
+    item.lastDate = now;
+    if (ended) {
+        KiraIslandFinish(item.activityID, success, received, expected);
+        [gTasks removeObjectForKey:task];
+        NSLog(@"[KiraIsland] END id=%d success=%d", item.activityID, (int)success);
+    } else {
+        KiraIslandProgress(item.activityID, received, expected, speed);
+    }
+}
+
+// Delegate callback hook may execute on a URLSession background delegate queue.
+// Funnel all dictionary and ActivityKit state operations through the main queue.
+static void IKObserveTask(NSURLSessionTask *task, int64_t received, int64_t expected,
+                          BOOL ended, BOOL success) {
+    if (!task) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        IKUpdate(task, received, expected, ended, success);
+    });
+}
+
+static void IKPoll(NSTimer *timer) {
+    (void)timer;
+    NSArray<NSURLSessionTask *> *all = [[gTasks keyEnumerator] allObjects];
+    for (NSURLSessionTask *task in all) {
+        NSURLSessionTaskState state = task.state;
+        BOOL finished = state == NSURLSessionTaskStateCompleted ||
+                        state == NSURLSessionTaskStateCanceling;
+        IKUpdate(task, task.countOfBytesReceived, task.countOfBytesExpectedToReceive,
+                 finished, finished && task.error == nil &&
+                 state == NSURLSessionTaskStateCompleted);
+    }
+    if (gTasks.count == 0 && gPollingTimer) {
+        [gPollingTimer invalidate];
+        gPollingTimer = nil;
     }
 }
 
 static void IKRegisterTask(NSURLSessionTask *task) {
-    if (![task isKindOfClass:[NSURLSessionDownloadTask class]] &&
-        ![task isKindOfClass:[NSURLSessionDataTask class]]) return;
-    void (^add)(void) = ^{
-        if (!gDownloads) gDownloads = [NSMapTable strongToStrongObjectsMapTable];
-        if ([gDownloads objectForKey:task]) return;
-        IKDownloadObservation *obs = [IKDownloadObservation new];
-        obs.task = task;
-        obs.previousTime = [NSDate date];
-        [gDownloads setObject:obs forKey:task];
-        if (!gTimer) {
-            gTimer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-                IKPollDownloads(t);
+    if (!task) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        IKGetOrCreate(task);
+        if (!gPollingTimer) {
+            gPollingTimer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+                IKPoll(timer);
             }];
-            [[NSRunLoop mainRunLoop] addTimer:gTimer forMode:NSRunLoopCommonModes];
+            [[NSRunLoop mainRunLoop] addTimer:gPollingTimer forMode:NSRunLoopCommonModes];
         }
-    };
-    if ([NSThread isMainThread]) add();
-    else dispatch_async(dispatch_get_main_queue(), add);
+    });
 }
 
-static BOOL IKIsSubclass(Class cls, Class target) {
-    for (Class parent = cls; parent != Nil; parent = class_getSuperclass(parent)) {
-        if (parent == target) return YES;
-    }
+static BOOL IKSubclassOf(Class cls, Class root) {
+    while (cls) { if (cls == root) return YES; cls = class_getSuperclass(cls); }
     return NO;
 }
 
-static void IKInstallDownloadHook(void) {
-    if (!gHookedClasses) gHookedClasses = [NSMutableSet set];
-    unsigned int n = 0;
-    Class *classes = objc_copyClassList(&n);
-    unsigned installed = 0;
-    SEL selector = @selector(resume);
-    for (unsigned int i=0; i<n; ++i) {
+// Install a method hook only for methods implemented directly by that class.
+// Subclasses inheriting a method automatically use their superclass hook.
+static BOOL IKInstall(Class cls, SEL selector, id block, NSString *identifier) {
+    if ([gInstalled containsObject:identifier]) return NO;
+    unsigned count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    Method found = NULL;
+    for (unsigned j = 0; j < count; j++) {
+        if (method_getName(methods[j]) == selector) { found = methods[j]; break; }
+    }
+    free(methods);
+    if (!found) return NO;
+    IMP imp = imp_implementationWithBlock(block);
+    method_setImplementation(found, imp);
+    [gInstalled addObject:identifier];
+    return YES;
+}
+
+static void IKInstallHooks(void) {
+    if (!gInstalled) gInstalled = [NSMutableSet new];
+    unsigned count = 0;
+    Class *classes = objc_copyClassList(&count);
+    unsigned hooks = 0;
+
+    SEL resume = @selector(resume);
+    SEL write = @selector(URLSession:downloadTask:didWriteData:totalBytesWritten:totalBytesExpectedToWrite:);
+    SEL data = @selector(URLSession:dataTask:didReceiveData:);
+    SEL finish = @selector(URLSession:downloadTask:didFinishDownloadingToURL:);
+    SEL complete = @selector(URLSession:task:didCompleteWithError:);
+
+    for (unsigned i = 0; i < count; i++) {
         Class cls = classes[i];
-        if (!IKIsSubclass(cls, [NSURLSessionTask class])) continue;
         NSString *name = NSStringFromClass(cls);
-        if ([gHookedClasses containsObject:name]) continue;
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(cls, &methodCount);
-        for (unsigned int j=0; j<methodCount; ++j) {
-            Method method = methods[j];
-            if (method_getName(method) != selector) continue;
-            IMP original = method_getImplementation(method);
-            IMP replacement = imp_implementationWithBlock(^(id obj) {
-                ((void (*)(id, SEL))original)(obj, selector);
-                IKRegisterTask((NSURLSessionTask *)obj);
-            });
-            method_setImplementation(method, replacement);
-            [gHookedClasses addObject:name];
-            installed++;
-            break;
+        if (IKSubclassOf(cls, [NSURLSessionTask class])) {
+            // Use the original implementation, then observe the resumed task.
+            Method method = class_getInstanceMethod(cls, resume);
+            IMP original = method ? method_getImplementation(method) : NULL;
+            if (original) {
+                id block = ^(NSURLSessionTask *task) {
+                    ((void (*)(id, SEL))original)(task, resume);
+                    IKRegisterTask(task);
+                };
+                if (IKInstall(cls, resume, block, [name stringByAppendingString:@":resume"])) hooks++;
+            }
         }
-        free(methods);
+        // These are actual user download progress callbacks (not guessed).
+        Method writeMethod = class_getInstanceMethod(cls, write);
+        IMP writeOriginal = writeMethod ? method_getImplementation(writeMethod) : NULL;
+        if (writeOriginal) {
+            id block = ^(id self, NSURLSession *session, NSURLSessionDownloadTask *task,
+                         int64_t bytes, int64_t total, int64_t expected) {
+                ((void (*)(id,SEL,id,id,int64_t,int64_t,int64_t))writeOriginal)(
+                    self, write, session, task, bytes, total, expected);
+                IKRegisterTask(task);
+                IKObserveTask(task, total, expected, NO, NO);
+            };
+            if (IKInstall(cls, write, block, [name stringByAppendingString:@":didWriteData"])) hooks++;
+        }
+        Method dataMethod = class_getInstanceMethod(cls, data);
+        IMP dataOriginal = dataMethod ? method_getImplementation(dataMethod) : NULL;
+        if (dataOriginal) {
+            id block = ^(id self, NSURLSession *session, NSURLSessionDataTask *task, NSData *chunk) {
+                ((void (*)(id,SEL,id,id,id))dataOriginal)(self, data, session, task, chunk);
+                IKRegisterTask(task);
+                IKObserveTask(task, task.countOfBytesReceived, task.countOfBytesExpectedToReceive, NO, NO);
+            };
+            if (IKInstall(cls, data, block, [name stringByAppendingString:@":didReceiveData"])) hooks++;
+        }
+        Method finishMethod = class_getInstanceMethod(cls, finish);
+        IMP finishOriginal = finishMethod ? method_getImplementation(finishMethod) : NULL;
+        if (finishOriginal) {
+            id block = ^(id self, NSURLSession *session, NSURLSessionDownloadTask *task, NSURL *location) {
+                ((void (*)(id,SEL,id,id,id))finishOriginal)(self, finish, session, task, location);
+                IKObserveTask(task, task.countOfBytesReceived, task.countOfBytesExpectedToReceive, YES, YES);
+            };
+            if (IKInstall(cls, finish, block, [name stringByAppendingString:@":didFinish"])) hooks++;
+        }
+        Method completeMethod = class_getInstanceMethod(cls, complete);
+        IMP completeOriginal = completeMethod ? method_getImplementation(completeMethod) : NULL;
+        if (completeOriginal) {
+            id block = ^(id self, NSURLSession *session, NSURLSessionTask *task, NSError *error) {
+                ((void (*)(id,SEL,id,id,id))completeOriginal)(self, complete, session, task, error);
+                IKObserveTask(task, task.countOfBytesReceived, task.countOfBytesExpectedToReceive,
+                              YES, error == nil);
+            };
+            if (IKInstall(cls, complete, block, [name stringByAppendingString:@":didComplete"])) hooks++;
+        }
     }
     free(classes);
-    NSLog(@"[KiraIsland] Hooked %u newly loaded URLSessionTask resume methods", installed);
+    if (hooks > 0) NSLog(@"[KiraIsland] Runtime hooks installed: %u", hooks);
 }
 
 __attribute__((constructor)) static void IKLoadNetworkHooks(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        IKInstallDownloadHook();
-        // NSURLSession concrete subclasses may be loaded lazily by iOS.
-        // Revisit only classes that have not yet been hooked.
-        __block int checks = 0;
-        [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *timer) {
-            IKInstallDownloadHook();
-            checks++;
-            if (checks >= 12) [timer invalidate];
+        IKInstallHooks();
+        // System creates concrete URLSession classes lazily. Scan for newly
+        // registered classes during the first minutes of normal app usage.
+        __block unsigned attempts = 0;
+        [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *timer) {
+            IKInstallHooks();
+            if (++attempts >= 90) [timer invalidate];
         }];
-        // No more 50% diagnostic test. Live Activities are created only
-        // when actual tasks with qualifying download responses are observed.
+        // Deliberately no automatic fake 50% test.
     });
 }
