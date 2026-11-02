@@ -4,6 +4,29 @@
 #import <stdint.h>
 #import "IslandBridge.h"
 
+// Debug build: no URLs, access tokens or file contents are logged.
+// The small trace is exposed through the host app's Documents folder.
+static NSUInteger gTraceCount = 0;
+static void IKTrace(NSString *event) {
+    if (gTraceCount++ >= 200 || !event.length) return;
+    NSString *documents = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!documents.length) return;
+    NSString *path = [documents stringByAppendingPathComponent:@"island-debug.txt"];
+    NSString *line = [NSString stringWithFormat:@"%.0f %@\n",
+                      [NSDate date].timeIntervalSince1970, event];
+    NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!file) {
+        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+        file = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (file) {
+        [file seekToEndOfFile];
+        [file writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [file closeFile];
+    }
+}
+
 // Does not change requests, stored data, delegate callbacks or existing
 // download logic. Observes NSURLSession delegate callbacks to identify
 // user-visible transfers and pass their actual byte counts to ActivityKit.
@@ -61,6 +84,7 @@ static IKTaskObservation *IKGetOrCreate(NSURLSessionTask *task) {
         item.task = task;
         item.lastDate = [NSDate date];
         [gTasks setObject:item forKey:task];
+        IKTrace(@"Observed a URLSession task");
     }
     return item;
 }
@@ -83,6 +107,7 @@ static void IKUpdate(NSURLSessionTask *task, int64_t received, int64_t expected,
         item.lastDate = now;
         KiraIslandStart(item.activityID, name.UTF8String);
         NSLog(@"[KiraIsland] START %@ received=%lld expected=%lld", name, received, expected);
+        IKTrace([NSString stringWithFormat:@"Live Activity start, bytes=%lld total=%lld", received, expected]);
     }
 
     if (!item.running) {
@@ -98,6 +123,7 @@ static void IKUpdate(NSURLSessionTask *task, int64_t received, int64_t expected,
         KiraIslandFinish(item.activityID, success, received, expected);
         [gTasks removeObjectForKey:task];
         NSLog(@"[KiraIsland] END id=%d success=%d", item.activityID, (int)success);
+        IKTrace([NSString stringWithFormat:@"Live Activity finish, success=%d", (int)success]);
     } else {
         KiraIslandProgress(item.activityID, received, expected, speed);
     }
@@ -237,10 +263,14 @@ static void IKInstallHooks(void) {
         }
     }
     free(classes);
-    if (hooks > 0) NSLog(@"[KiraIsland] Runtime hooks installed: %u", hooks);
+    if (hooks > 0) {
+        NSLog(@"[KiraIsland] Runtime hooks installed: %u", hooks);
+        IKTrace([NSString stringWithFormat:@"Installed %u additional runtime hooks", hooks]);
+    }
 }
 
 __attribute__((constructor)) static void IKLoadNetworkHooks(void) {
+    IKTrace(@"Island library loaded");
     dispatch_async(dispatch_get_main_queue(), ^{
         IKInstallHooks();
         // System creates concrete URLSession classes lazily. Scan for newly
