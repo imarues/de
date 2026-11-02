@@ -1,0 +1,46 @@
+name: Build DataManager Island Dylib
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'project.yml'
+      - 'Hook/**'
+      - 'Widget/**'
+      - 'Shared/**'
+      - 'Demo/**'
+      - '.github/workflows/datamanager-island.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build unsigned iOS components
+        run: |
+          xcodebuild -project DataManagerIsland.xcodeproj \
+            -scheme IslandDemo -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Collect binaries
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="build/Build/Products/Release-iphoneos"
+          mkdir -p output
+          find "$SRC" -type f \( -name 'libIslandHook.dylib' -o -name '*.dylib' \) -exec cp {} output/ \;
+          find "$SRC" -maxdepth 1 -type d \( -name '*.appex' -o -name '*.framework' -o -name '*.app' \) -exec cp -R {} output/ \;
+          test -s output/libIslandHook.dylib
+          file output/libIslandHook.dylib
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: datamanager-island-unsigned
+          path: output/
+          if-no-files-found: error

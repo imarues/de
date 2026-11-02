@@ -1,0 +1,71 @@
+name: DataManagerIsland
+options:
+  bundleIdPrefix: dev.ikiraplus
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    IPHONEOS_DEPLOYMENT_TARGET: '16.6'
+    TARGETED_DEVICE_FAMILY: '1'
+    CODE_SIGN_STYLE: Automatic
+    SUPPORTS_MACCATALYST: NO
+schemes:
+  IslandDemo:
+    build:
+      targets:
+        IslandDemo: all
+        IslandWidget: all
+        IslandShared: all
+        IslandHook: all
+targets:
+  IslandShared:
+    type: framework
+    platform: iOS
+    sources:
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ikiraplus.island.shared
+        DEFINES_MODULE: YES
+  IslandHook:
+    type: library.dynamic
+    platform: iOS
+    sources:
+      - Hook/IslandBridge.swift
+    dependencies:
+      - target: IslandShared
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ikiraplus.island.hook
+        PRODUCT_NAME: libIslandHook
+  IslandWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Widget/DownloadActivityWidget.swift
+    info:
+      path: Widget/Info.plist
+    dependencies:
+      - target: IslandShared
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ikiraplus.island.demo.widget
+        APPLICATION_EXTENSION_API_ONLY: YES
+  IslandDemo:
+    type: application
+    platform: iOS
+    sources:
+      - Demo/DemoApp.swift
+    info:
+      path: Demo/Info.plist
+    dependencies:
+      - target: IslandShared
+        embed: true
+      - target: IslandHook
+        embed: true
+      - target: IslandWidget
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.ikiraplus.island.demo
